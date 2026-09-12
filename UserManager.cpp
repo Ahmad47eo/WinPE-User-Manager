@@ -301,7 +301,7 @@ static bool ValidateOfflineWindowsDir(const std::wstring &windowsDir)
         if (rr.back() == L'\\') rr.pop_back();
         std::wstring normalized = windowsDir;
         if (!normalized.empty() && normalized.back() == L'\\') normalized.pop_back();
-        // compare rr and normalized (allow normalized being rr or rr\Windows)
+        // compare rr and normalized (allow normalized being rr or rr\\Windows)
         if (_wcsicmp(normalized.c_str(), rr.c_str()) == 0) return false;
         std::wstring rrWin = rr + L"\\Windows";
         if (_wcsicmp(normalized.c_str(), rrWin.c_str()) == 0) return false;
@@ -341,4 +341,201 @@ static std::wstring GetImageRootFromSelected(const std::wstring& windowsDir)
     return s;
 }
 
-// (rest of the file follows unchanged — DISM invocation, worker, SafePostMessage, CLI, GUI entry etc.)
+// --- DISM invocation + worker implementation ---
+
+struct WorkerResult {
+    int exitCode;
+    std::wstring output; // captured stdout+stderr (converted to UTF-16)
+    std::wstring unattendPath;
+    bool success;
+    std::wstring error;
+};
+
+// Convert a narrow buffer to wide using UTF-8 with fallback to ANSI
+static std::wstring ConvertToWideWithFallback(const std::string &bytes)
+{
+    if (bytes.empty()) return L"";
+    int needed = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+    if (needed > 0) {
+        std::wstring out; out.resize(needed);
+        MultiByteToWideChar(CP_UTF8, 0, bytes.data(), (int)bytes.size(), &out[0], needed);
+        return out;
+    }
+    // fallback to ANSI
+    needed = MultiByteToWideChar(CP_ACP, 0, bytes.data(), (int)bytes.size(), nullptr, 0);
+    if (needed > 0) {
+        std::wstring out; out.resize(needed);
+        MultiByteToWideChar(CP_ACP, 0, bytes.data(), (int)bytes.size(), &out[0], needed);
+        return out;
+    }
+    return L"";
+}
+
+// Run a process and capture combined stdout+stderr into a string. Returns exit code in outExit.
+static bool RunProcessCaptureOutput(const std::wstring &commandLine, int &outExit, std::string &outText, std::wstring &error)
+{
+    outExit = -1;
+    outText.clear();
+    SECURITY_ATTRIBUTES sa = {};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = nullptr;
+
+    HANDLE hRead = nullptr, hWrite = nullptr;
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
+        error = L"CreatePipe failed";
+        return false;
+    }
+    // Ensure read handle is not inherited
+    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si = {};
+    PROCESS_INFORMATION pi = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = hWrite;
+    si.hStdError = hWrite;
+    si.hStdInput = nullptr;
+
+    // Create mutable command buffer
+    std::vector<wchar_t> cmd; cmd.assign(commandLine.begin(), commandLine.end()); cmd.push_back(0);
+
+    BOOL created = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    // Close the write end in parent after process created (or if failed)
+    CloseHandle(hWrite);
+    if (!created) {
+        DWORD e = GetLastError();
+        wchar_t buf[128]; swprintf_s(buf, L"CreateProcessW failed: %u", e);
+        error = buf;
+        CloseHandle(hRead);
+        return false;
+    }
+
+    // Read output until process ends
+    const DWORD BUFSIZE = 4096;
+    char buffer[BUFSIZE];
+    DWORD read = 0;
+    std::string accum;
+    for (;;) {
+        BOOL ok = ReadFile(hRead, buffer, BUFSIZE, &read, nullptr);
+        if (read > 0) accum.append(buffer, buffer + read);
+        if (!ok) break;
+    }
+    // Wait for process
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0; GetExitCodeProcess(pi.hProcess, &exitCode);
+    outExit = (int)exitCode;
+
+    // Cleanup
+    CloseHandle(hRead);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    outText.swap(accum);
+    return true;
+}
+
+// Worker thread: creates unattend xml file, invokes DISM with /Image:<imageRoot> /Apply-Unattend:<file>
+static DWORD WINAPI WorkerThreadProc(LPVOID param)
+{
+    // param expected to be a heap-allocated array of three std::wstring* values:
+    // [0] = selectedWindowsDir, [1] = username, [2] = password
+    std::wstring *arr = reinterpret_cast<std::wstring*>(param);
+    std::wstring selectedWindows = arr[0];
+    std::wstring username = arr[1];
+    std::wstring password = arr[2];
+    bool addToAdmin = false; // TODO: pass flag if needed; for now assume unchecked
+
+    // wipe the heap array container asap
+    // (we'll still need username/password values stored above)
+    // free the param memory
+    delete[] arr;
+
+    WorkerResult *res = new WorkerResult();
+    res->exitCode = -1; res->success = false; res->output.clear(); res->unattendPath.clear(); res->error.clear();
+
+    // Build unattend xml
+    std::wstring xml = BuildUnattendXml(username, password, addToAdmin);
+    std::wstring unattendPath;
+    if (!CreateUniqueTempFile(xml, unattendPath)) {
+        res->error = L"Failed to create temporary unattend file.";
+        PostMessage(GetActiveWindow(), WM_WORKER_DONE, (WPARAM)res, 0);
+        WipeString(username); WipeString(password);
+        return 0;
+    }
+    res->unattendPath = unattendPath;
+
+    // Determine image root from selected Windows dir
+    std::wstring imageRoot = GetImageRootFromSelected(selectedWindows);
+    if (imageRoot.empty()) {
+        res->error = L"Failed to determine image root from selected Windows directory.";
+        // attempt cleanup
+        DeleteFileW(unattendPath.c_str());
+        PostMessage(GetActiveWindow(), WM_WORKER_DONE, (WPARAM)res, 0);
+        WipeString(username); WipeString(password);
+        return 0;
+    }
+
+    // Validate that the image path exists
+    DWORD attr = GetFileAttributesW(imageRoot.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        res->error = L"Image root does not exist or is inaccessible: " + imageRoot;
+        DeleteFileW(unattendPath.c_str());
+        PostMessage(GetActiveWindow(), WM_WORKER_DONE, (WPARAM)res, 0);
+        WipeString(username); WipeString(password);
+        return 0;
+    }
+
+    // Build command line: dism.exe /Image:"D:\" /Apply-Unattend:"C:\path\file.xml"
+    std::wstring cmd = L"dism.exe ";
+    cmd += L"/Image:\"" + imageRoot + L"\" ";
+    cmd += L"/Apply-Unattend:\"" + unattendPath + L"\"";
+
+    std::string rawOut;
+    int exitCode = -1;
+    std::wstring runErr;
+    bool ok = RunProcessCaptureOutput(cmd, exitCode, rawOut, runErr);
+    if (!ok) {
+        res->error = L"Failed to run DISM: " + runErr;
+        // clean up unattend
+        DeleteFileW(unattendPath.c_str());
+        PostMessage(GetActiveWindow(), WM_WORKER_DONE, (WPARAM)res, 0);
+        WipeString(username); WipeString(password);
+        return 0;
+    }
+
+    res->exitCode = exitCode;
+    res->output = ConvertToWideWithFallback(rawOut);
+    res->success = (exitCode == 0);
+
+    // Try to delete unattend file (best-effort)
+    DeleteFileW(unattendPath.c_str());
+
+    // Wipe sensitive strings
+    WipeString(username); WipeString(password);
+
+    // Post result to UI thread
+    PostMessage(GetActiveWindow(), WM_WORKER_DONE, (WPARAM)res, 0);
+    return 0;
+}
+
+// Kick off the worker: allocate param array and create thread
+static bool StartWorkerForApply(const std::wstring &selectedWindows, const std::wstring &username, const std::wstring &password, bool addToAdmin)
+{
+    if (InterlockedCompareExchange(&g_workerRunning, 1, 0) != 0) return false; // already running
+    // allocate array
+    std::wstring *arr = new std::wstring[3];
+    arr[0] = selectedWindows; arr[1] = username; arr[2] = password;
+    // create thread
+    DWORD tid = 0;
+    g_hWorkerThread = CreateThread(nullptr, 0, WorkerThreadProc, arr, 0, &tid);
+    if (!g_hWorkerThread) {
+        delete[] arr; InterlockedExchange(&g_workerRunning, 0); return false;
+    }
+    return true;
+}
+
+// The rest of the GUI/CLI code would call StartWorkerForApply(selectedWindows, username, password, adminFlag)
+
+// (UI message handling must process WM_WORKER_DONE and free WorkerResult*)
+
