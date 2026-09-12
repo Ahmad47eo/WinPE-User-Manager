@@ -486,10 +486,26 @@ static DWORD WINAPI WorkerThreadProc(LPVOID param)
         return 0;
     }
 
-    // Build command line: dism.exe /Image:"D:\" /Apply-Unattend:"C:\path\file.xml"
+    // Build command line robustly to avoid trailing-backslash-before-quote issues
+    auto TrimTrailingBackslash = [](std::wstring p) {
+        while (!p.empty() && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+        return p;
+    };
+
     std::wstring cmd = L"dism.exe ";
-    cmd += L"/Image:\"" + imageRoot + L"\" ";
-    cmd += L"/Apply-Unattend:\"" + unattendPath + L"\"";
+
+    // /Image: - avoid quoting simple drive roots (no spaces); if quoting needed remove trailing backslash first
+    if (imageRoot.find(L' ') == std::wstring::npos) {
+        // use unquoted form (e.g. /Image:D:\)
+        cmd += L"/Image:" + imageRoot + L" ";
+    } else {
+        std::wstring img = TrimTrailingBackslash(imageRoot);
+        cmd += L"/Image:\"" + img + L"\" ";
+    }
+
+    // /Apply-Unattend: - quote the unattend path (remove trailing backslash before quoting)
+    std::wstring unattendQuoted = TrimTrailingBackslash(unattendPath);
+    cmd += L"/Apply-Unattend:\"" + unattendQuoted + L"\"";
 
     std::string rawOut;
     int exitCode = -1;
