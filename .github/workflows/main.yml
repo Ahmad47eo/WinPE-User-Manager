@@ -1,0 +1,33 @@
+name: Build WinPE User Manager (x64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (x64)
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Compile with MSVC (cl)
+      shell: cmd
+      run: |
+        @echo Finding Visual Studio installation via vswhere...
+        for /f "delims=" %%i in ('"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath') do set VSINSTALL=%%i
+        if not defined VSINSTALL (
+          echo Visual Studio installation not found and cl.exe is unavailable.
+          exit /b 1
+        )
+        echo Using Visual Studio at %VSINSTALL%
+        call "%VSINSTALL%\Common7\Tools\VsDevCmd.bat" -arch=amd64
+        echo Building UserManager.cpp...
+        cl /EHsc /W4 /DUNICODE /D_UNICODE /MT /O2 UserManager.cpp /link /SUBSYSTEM:WINDOWS /MACHINE:X64 /OUT:UserManager.exe
+
+    - name: Upload built executable
+      uses: actions/upload-artifact@v4
+      with:
+        name: UserManager-exe
+        path: UserManager.exe
